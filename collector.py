@@ -32,7 +32,7 @@ MAX_PINNED_LIMITS = 3
 PROVIDERS = {'codex': 'Codex', 'claude': 'Claude', 'opencode-go': 'OpenCode Go', 'grok': 'Grok Build',
              'gemini': 'Gemini CLI', 'opencode': 'OpenCode', 'pi': 'Pi', 'omp': 'Oh My Pi', 'muse': 'Muse',
              'ollama-cloud': 'Ollama Cloud', 'commandcode': 'CommandCode',
-             'clinepass': 'ClinePass', 'cursor': 'Cursor'}
+             'clinepass': 'ClinePass', 'cursor': 'Cursor', 'hermes': 'Hermes Agent'}
 HOME_KEYS = ('codexHomes', 'claudeHomes', 'grokHomes', 'geminiHomes', 'opencodeHomes', 'piHomes', 'ompHomes',
              'museHomes', 'commandcodeHomes', 'hermesHomes')
 # Provider ids used by the Hermes agent's own per-model usage table. Hermes
@@ -42,6 +42,8 @@ HOME_KEYS = ('codexHomes', 'claudeHomes', 'grokHomes', 'geminiHomes', 'opencodeH
 # account is not two accounts because one call used the Anthropic shape.
 HERMES_ROUTES = ('opencode-go', 'ollama-cloud', 'commandcode', 'commandcode-anthropic', 'clinepass')
 HERMES_ROUTE_NAMES = {'commandcode-anthropic': 'commandcode'}
+# Every other route Hermes bills (Nous Portal, ChatGPT/Codex login, ...) has no
+# CLI app of its own here, so those rows form the standalone 'hermes' provider.
 HERMES_TASKS = {'': 'conversation', 'title_generation': 'title generation', 'background_review': 'background review',
                 'approval': 'approval', 'compression': 'context compression', 'vision': 'vision',
                 'embedding': 'embedding'}
@@ -823,13 +825,12 @@ def hermes_records(path):
             raise ValueError('Not a Hermes usage ledger')
         try: projects = {r[0]: r[1] for r in conn.execute('SELECT id, cwd FROM sessions')}
         except sqlite3.Error: projects = {}
-        wanted = ','.join('?' for _ in HERMES_ROUTES)
-        for row in conn.execute(f'SELECT * FROM session_model_usage WHERE billing_provider IN ({wanted})', HERMES_ROUTES):
+        for row in conn.execute('SELECT * FROM session_model_usage'):
             r = dict(row)
             # Collapse the wire-format variants onto one provider, keeping the
             # raw route on apiProvider for the Routes breakdown.
             route = r['billing_provider']
-            provider = HERMES_ROUTE_NAMES.get(route, route)
+            provider = HERMES_ROUTE_NAMES.get(route, route) if route in HERMES_ROUTES else 'hermes'
             session, model = str(r['session_id']), r['model'] or 'unknown'
             task = str(r.get('task') or '')
             # Anchor the row at its first sighting. The table accumulates in
@@ -1081,11 +1082,12 @@ class Ledger:
                             self.db.execute('INSERT OR REPLACE INTO files VALUES (?,?,?)', (str(path), stat.st_size, stat.st_mtime_ns))
                     except (OSError, ValueError, TypeError, AttributeError):
                         source['readErrors'] = source.get('readErrors', 0) + 1
-        hermes_roots = [str(HOME / '.hermes')] + cfg.get('hermesHomes', [])
+        hermes_home = HOME / '.hermes'
+        hermes_roots = [str(hermes_home)] + [str(p.parent) for p in sorted(hermes_home.glob('profiles/*/state.db'))] + cfg.get('hermesHomes', [])
         for root in sorted(set(hermes_roots)):
             path = hermes_ledger_path(root)
             source = {'provider': 'hermes', 'path': str(path), 'files': int(path.exists()),
-                      'exists': path.exists(), 'kind': 'database', 'clients': list(HERMES_ROUTES)}
+                      'exists': path.exists(), 'kind': 'database', 'clients': ['Hermes']}
             sources.append(source)
             if not path.exists() or (local_only and not self.database_changed(path)): continue
             try:
@@ -1185,6 +1187,7 @@ def price(r, catalog):
     if r['provider'] == 'cursor': return r.get('reportedValue'), None
     if r['provider'] in ('opencode', 'pi', 'omp') and r.get('reportedValue') is not None:
         return r['reportedValue'], None
+    if r['provider'] == 'hermes' and r.get('reportedValue'): return r['reportedValue'], None
     fallback = r.get('reportedValue') if r['provider'] == 'opencode-go' else None
     fallback = (fallback, None) if fallback is not None else (None, None)
     model = r['model']
@@ -1194,6 +1197,7 @@ def price(r, catalog):
     # through to the lab's own list price for a same-named model.
     if r['provider'] in ('commandcode', 'clinepass'):
         lookup = r['provider'] + '/' + model
+    if r['provider'] == 'hermes' and r.get('apiProvider') == 'openai-codex': lookup = 'codex/' + model
     rate = catalog.get(lookup)
     if not rate and r['provider'] not in ('ollama-cloud', 'commandcode', 'clinepass'):
         rate = catalog.get(model) or catalog.get('anthropic/' + model) or catalog.get('openai/' + model) or catalog.get('gemini/' + model)

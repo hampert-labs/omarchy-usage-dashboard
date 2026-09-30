@@ -3,15 +3,23 @@
   "url": "https://platform.claude.com/docs/en/models/opus-5-5/overview",
   "verifiedAt": "2026-09-23",
   "notes": [
-    "Direct Claude API-equivalent rates per million tokens. The five-minute and one-hour cache writes have separate published rates."
+    "Direct Claude API-equivalent rates per million tokens. The five-minute and one-hour cache writes have separate published rates.",
+    "Sonnet 5.5 rates ($2 input, $10 output, $2.50 5-minute and $4 1-hour cache writes, $0.20 cache reads per million tokens) were verified against https://platform.claude.com/docs/en/about-claude/pricing on 2026-09-30."
   ],
   "models": {
     "claude/claude-opus-5-5": {
-      "input_cost_per_token": 0.000004,
-      "output_cost_per_token": 0.00002,
-      "cache_read_input_token_cost": 0.0000002,
-      "cache_creation_input_token_cost": 0.000005,
-      "cache_creation_input_token_cost_above_1hr": 0.000008
+      "input_cost_per_token": 4e-06,
+      "output_cost_per_token": 2e-05,
+      "cache_read_input_token_cost": 2e-07,
+      "cache_creation_input_token_cost": 5e-06,
+      "cache_creation_input_token_cost_above_1hr": 8e-06
+    },
+    "claude/claude-sonnet-5-5": {
+      "input_cost_per_token": 2e-06,
+      "output_cost_per_token": 1e-05,
+      "cache_read_input_token_cost": 2e-07,
+      "cache_creation_input_token_cost": 2.5e-06,
+      "cache_creation_input_token_cost_above_1hr": 4e-06
     }
   }
 }

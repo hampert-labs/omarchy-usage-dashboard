@@ -613,7 +613,7 @@ Panel {
   // is invisible, so the icon appears the moment the first scan finds usage and
   // stays away entirely on a machine that has never run either CLI.
   visible: providers.length > 0
-  implicitWidth: button.implicitWidth
+  implicitWidth: meters.visible ? meters.implicitWidth : button.implicitWidth
   implicitHeight: button.implicitHeight
 
   onProviderIndexChanged: if (panelFlick) panelFlick.contentY = 0
@@ -658,9 +658,77 @@ Panel {
     function next(): string { root.selectProvider(root.providerIndex + 1); return "ok" }
   }
 
+  // Live limit bars for Codex and Claude, next to the icon. Each shows the
+  // fullest window of that provider, the one that stops the next prompt.
+  readonly property var meterRows: {
+    var rows = [], ids = [["codex", "codex"], ["claude", "claude"]]
+    for (var i = 0; i < ids.length; i++) {
+      for (var j = 0; j < providers.length; j++) {
+        if (providers[j].providerId !== ids[i][0]) continue
+        var w = bindingWindow(providers[j])
+        if (w) rows.push({tag: ids[i][1], percent: Math.max(0, Math.min(1, w.percent))})
+      }
+    }
+    return rows
+  }
+
+  Row {
+    id: meters
+    visible: meterRows.length > 0 && !(bar && bar.vertical)
+    anchors.right: parent.right
+    anchors.verticalCenter: parent.verticalCenter
+    spacing: Style.space(10)
+
+    Repeater {
+      model: root.meterRows
+      Row {
+        required property var modelData
+        spacing: Style.space(4)
+        Image {
+          // Light bar text means a dark bar, which takes the plain (white) mark.
+          source: Qt.resolvedUrl("assets/" + modelData.tag + (modelData.tag === "codex" && root.colorLuminance(root.foreground) < 0.2 ? "-light" : "") + ".svg")
+          width: Style.space(14); height: Style.space(14)
+          sourceSize.width: Style.space(28); sourceSize.height: Style.space(28)
+          fillMode: Image.PreserveAspectFit
+          anchors.verticalCenter: parent.verticalCenter
+        }
+        Rectangle {
+          width: Style.space(34); height: Style.space(5); radius: height / 2
+          color: root.track
+          anchors.verticalCenter: parent.verticalCenter
+          Rectangle {
+            width: parent.width * modelData.percent; height: parent.height; radius: parent.radius
+            color: modelData.percent >= 0.9 ? root.urgent : root.foreground
+          }
+        }
+        Text {
+          text: Math.round(modelData.percent * 100) + "%"
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.space(11)
+          anchors.verticalCenter: parent.verticalCenter
+        }
+      }
+    }
+  }
+
+  // Clicking the bars opens the quick panel, which links to the full dashboard.
+  MouseArea {
+    anchors.fill: meters
+    anchors.margins: -Style.space(4)
+    visible: meters.visible
+    cursorShape: Qt.PointingHandCursor
+    onClicked: root.toggle()
+  }
+
   BarIconButton {
     id: button
-    anchors.fill: parent
+    // The icon only appears while there are no bars to click.
+    visible: !meters.visible
+    anchors.left: parent.left
+    anchors.top: parent.top
+    anchors.bottom: parent.bottom
+    width: meters.visible ? 0 : implicitWidth
     bar: root.bar
     text: "󱚣"
     active: root.alarming
@@ -673,7 +741,7 @@ Panel {
 
   KeyboardPanel {
     id: panel
-    anchorItem: button
+    anchorItem: meters.visible ? meters : button
     owner: root
     bar: root.bar
     open: root.opened
