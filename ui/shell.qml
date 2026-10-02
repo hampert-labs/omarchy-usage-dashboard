@@ -150,7 +150,7 @@ Scope {
     }
     function when(ts) { return ts ? Qt.formatDateTime(new Date(ts*1000), "MMM d, yyyy " + shortTimePattern) : "No recorded activity" }
     property string breakdown: "models"
-    readonly property var breakdownItems: data ? (data[breakdown] || []) : []
+    readonly property var breakdownItems: data ? (data[breakdown] || []).slice().sort((a,b) => (freshTokens(b) || 0) - (freshTokens(a) || 0)) : []
     onBreakdownChanged: resetTableLimit()
     property bool settingsOpen: false
     property string settingsTab: "sources"
@@ -232,11 +232,30 @@ Scope {
         return !!pulseSummary && !!data && days === 1 && Object.keys(selection).length === 0
             && pulseSummary.date === Qt.formatDate(new Date(nowMs), "yyyy-MM-dd")
             && Number(pulseSummary.utcOffsetMinutes) === -new Date(nowMs).getTimezoneOffset()
+            && pulseIds().every(id => !pulseSummary.providers[id] || freshTokens(pulseSummary.providers[id]) !== null)
+    }
+    function freshTokens(bucket) {
+        if (!bucket) return 0
+        if (typeof bucket.freshTokens === "number") return bucket.freshTokens
+        var cached = cachedTokens(bucket)
+        return cached === null ? null : Math.max(0, Number(bucket.tokens || 0) - cached)
+    }
+    function cachedTokens(bucket) {
+        if (!bucket) return 0
+        return typeof bucket.cachedTokens === "number" ? bucket.cachedTokens
+             : typeof bucket.cacheRead === "number" ? bucket.cacheRead : null
+    }
+    function newTokenText(bucket) { var count = freshTokens(bucket); return count === null ? "—" : compact(count) }
+    function pulseIds() { return provider !== "all" ? [provider] : data.settings.enabled }
+    function pulseTotal(field) {
+        if (!liveTodayView()) return 0
+        return pulseIds().reduce((sum,id) => {
+            var bucket = pulseSummary.providers[id]
+            return sum + (field === "fresh" ? freshTokens(bucket) || 0 : field === "cached" ? cachedTokens(bucket) || 0 : Number(bucket ? bucket.tokens : 0))
+        }, 0)
     }
     function pulseTokens() {
-        if (!liveTodayView()) return 0
-        if (provider !== "all") return Number((pulseSummary.providers[provider] || {}).tokens || 0)
-        return data.settings.enabled.reduce((sum, id) => sum + Number((pulseSummary.providers[id] || {}).tokens || 0), 0)
+        return pulseTotal("fresh")
     }
     function pinnedName(pin) {
         if (!pin) return ""
@@ -281,7 +300,7 @@ Scope {
             ? "Local history checked under 1m ago" : "Local history checked " + Math.floor(age / 60) + "m ago"
     }
     function acceptPulse(value) {
-        if (!value || value.schemaVersion !== 1) return
+        if (!value || (value.schemaVersion !== 1 && value.schemaVersion !== 2)) return
         var signature = JSON.stringify([value.date, value.utcOffsetMinutes, value.providers, value.hours, value.unplacedTokens])
         var changed = pulseSignature !== "" && pulseSignature !== signature
         pulseSignature = signature
@@ -292,12 +311,12 @@ Scope {
     }
     function money(n) { return "$" + Number(n || 0).toLocaleString(Qt.locale("en_US"), 'f', 2) }
     function shortDate(value) { return value ? Qt.formatDate(new Date(value+"T12:00:00"),"MMM d") : "" }
-    function display(b) { return metric === "tokens" ? compact(b ? b.tokens : 0) : b && b.tokens > 0 && b.unpricedTokens === b.tokens ? "Unpriced" : money(b ? b.value : 0) }
-    function amount(b) { return b ? (metric === "tokens" ? b.tokens : b.value) : 0 }
+    function display(b) { return metric === "tokens" ? newTokenText(b) : b && b.tokens > 0 && b.unpricedTokens === b.tokens ? "Unpriced" : money(b ? b.value : 0) }
+    function amount(b) { return b ? (metric === "tokens" ? freshTokens(b) || 0 : b.value) : 0 }
     function valueText(b) { return b.unpricedTokens === b.tokens && b.tokens > 0 ? "Unpriced" : money(b.value) + (b.unpricedTokens ? " + unpriced" : "") }
     function comparisonText() {
         if (!data || selection.hourStart) return ""
-        var current = Number(data.summary.tokens || 0), previous = Number(data.previous.tokens || 0)
+        var current = freshTokens(data.summary) || 0, previous = freshTokens(data.previous) || 0
         var span = selection.day ? "previous day" : days === 1 ? "yesterday so far" : "previous period"
         if (previous <= 0) return "No " + span + " baseline"
         var ratio = current / previous
@@ -900,7 +919,7 @@ Scope {
                                 anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 18; spacing: 12
                                 RowLayout { width: parent.width; spacing: 16
                                     Column { Layout.fillWidth: true; spacing: 6
-                                        Sub { text: root.liveTodayView() ? "PROCESSED TOKENS · TODAY" : "PROCESSED TOKENS"; font.letterSpacing: 1.1 }
+                                        Sub { text: root.liveTodayView() ? "NEW TOKENS · TODAY" : "NEW TOKENS"; font.letterSpacing: 1.1 }
                                         AnimatedTokenCount {
                                             id: pulseCounter
                                             visible: root.liveTodayView()
@@ -913,7 +932,7 @@ Scope {
                                             font.pixelSize: 27
                                             font.weight: Font.Medium
                                         }
-                                        Label { visible: !root.liveTodayView(); text: root.data ? root.compact(root.data.summary.tokens) : "…"; font.pixelSize: 31; font.weight: Font.Medium }
+                                        Label { visible: !root.liveTodayView(); text: root.data ? root.newTokenText(root.data.summary) : "…"; font.pixelSize: 31; font.weight: Font.Medium }
                                         Sub { text: root.liveTodayView() ? root.pulseStatus() : root.data ? root.data.summary.sessions + " sessions" : "Reading history" }
                                     }
                                     Column { Layout.fillWidth: true; spacing: 6
@@ -922,9 +941,9 @@ Scope {
                                         Sub { text: "Includes reasoning" }
                                     }
                                     Column { Layout.fillWidth: true; spacing: 6
-                                        Sub { text: "CACHE READ"; font.letterSpacing: 1.1 }
-                                        Label { text: root.data ? root.compact(root.data.summary.cacheRead) : "…"; font.pixelSize: 24 }
-                                        Sub { text: root.data && root.data.summary.tokens ? (root.data.summary.cacheRead/root.data.summary.tokens*100).toFixed(1)+"% of processed tokens" : "No activity" }
+                                        Sub { text: "CACHE REUSED"; font.letterSpacing: 1.1 }
+                                        Label { text: root.liveTodayView() ? root.compact(root.pulseTotal("cached")) : root.data ? root.compact(root.cachedTokens(root.data.summary)) : "…"; font.pixelSize: 24 }
+                                        Sub { text: "Reused context, counted per request" }
                                     }
                                     Column { Layout.fillWidth: true; spacing: 6
                                         Sub { text: "API VALUE ESTIMATE"; font.letterSpacing: 1.1 }
@@ -936,7 +955,7 @@ Scope {
                                 RowLayout { width: parent.width
                                     Label { visible: root.comparisonText() !== ""; text: root.comparisonText(); color: root.accent; font.pixelSize: 12 }
                                     Item { Layout.fillWidth: true }
-                                    Sub { text: "Processed tokens include reused context on each request" }
+                                    Sub { text: "Total including cache " + (root.liveTodayView() ? root.compact(root.pulseTotal("total")) : root.data ? root.compact(root.data.summary.tokens) : "…") }
                                 }
                             }
                         }
@@ -947,9 +966,9 @@ Scope {
                                 anchors.fill: parent; anchors.margins: 18; spacing: 10
                                 RowLayout {
                                     Layout.fillWidth: true
-                                    Label { text: root.selection.hourStart ? "Selected hour" : root.selection.day ? "Tokens by hour · "+root.selection.day : root.days === 1 ? "Tokens by hour · today" : "Daily activity"; font.weight: Font.DemiBold; font.pixelSize: 16 }
+                                    Label { text: root.selection.hourStart ? "Selected hour" : root.selection.day ? "New tokens by hour · "+root.selection.day : root.days === 1 ? "New tokens by hour · today" : "New token activity"; font.weight: Font.DemiBold; font.pixelSize: 16 }
                                     Item { Layout.fillWidth: true }
-                                    Choice { text: "Tokens"; selected: root.metric === "tokens"; onClicked: root.metric = "tokens" }
+                                    Choice { text: "New tokens"; selected: root.metric === "tokens"; onClicked: root.metric = "tokens" }
                                     Choice { text: "API value"; selected: root.metric === "value"; onClicked: root.metric = "value" }
                                 }
                                 HourlyActivity {
@@ -1043,7 +1062,9 @@ Scope {
                                         y: 16
                                         heading: chart.hovered>=0 && chart.hovered<chart.series.length ? (chart.hourly ? root.hourTitle(chart.series[chart.hovered]) : Qt.formatDate(new Date(chart.series[chart.hovered].date+"T12:00:00"),"dddd, MMM d")) : ""
                                         rows: chart.hovered>=0 && chart.hovered<chart.series.length && root.data ? [{label:"Total",value:root.display(chart.series[chart.hovered].total),color:root.accent}].concat(root.data.cards.map(c=>({label:c.name,value:root.display(chart.series[chart.hovered].cards[c.id]),color:root.accountColor(c.provider,c.shade)}))) : []
-                                        detail: (chart.hourly ? "This hour · " : "") + (root.metric === "tokens" ? "Processed tokens, including cached input" : "Estimated API value, not your bill")
+                                        detail: (chart.hourly ? "This hour · " : "") + (root.metric === "tokens" && chart.hovered >= 0 && chart.hovered < chart.series.length
+                                            ? "New tokens · Cache reused " + root.compact(root.cachedTokens(chart.series[chart.hovered].total))
+                                                + " · Total including cache " + root.compact(chart.series[chart.hovered].total.tokens) : "Estimated API value, not your bill")
                                     }
                                 }
                             }
@@ -1065,11 +1086,12 @@ Scope {
                                 Item { Layout.preferredWidth: 190 }
                                 Item { Layout.fillWidth: true }
                                 Sub { text: "LIMIT"; Layout.preferredWidth: 65; horizontalAlignment: Text.AlignRight }
-                                Sub { text: "TOKENS"; Layout.preferredWidth: 78; horizontalAlignment: Text.AlignRight }
+                                Sub { text: "NEW TOKENS"; Layout.preferredWidth: 90; horizontalAlignment: Text.AlignRight }
+                                Sub { text: "CACHE REUSED"; Layout.preferredWidth: 100; horizontalAlignment: Text.AlignRight }
                                 Sub { text: "API VALUE"; Layout.preferredWidth: 120; horizontalAlignment: Text.AlignRight }
                             }
                             Repeater {
-                                model: root.data ? root.data.cards.slice(0, root.providerRowsExpanded ? root.data.cards.length : 6) : []
+                                model: root.data ? root.data.cards.slice().sort((a,b) => (root.freshTokens(b) || 0) - (root.freshTokens(a) || 0)).slice(0, root.providerRowsExpanded ? root.data.cards.length : 6) : []
                                 Item {
                                     required property var modelData
                                     width: sourceColumn.width; height: 40
@@ -1077,10 +1099,11 @@ Scope {
                                         Rectangle { implicitWidth: 7; implicitHeight: 7; radius: 4; color: root.accountColor(modelData.provider,modelData.shade) }
                                         Label { text: modelData.name; Layout.preferredWidth: 190; elide: Text.ElideRight; font.pixelSize: 12 }
                                         Rectangle { Layout.fillWidth: true; implicitHeight: 5; radius: 3; color: root.edge
-                                            Rectangle { width: parent.width * (root.data && root.data.summary.tokens ? modelData.tokens/root.data.summary.tokens : 0); height: parent.height; radius: parent.radius; color: root.accountColor(modelData.provider,modelData.shade) }
+                                            Rectangle { width: parent.width * (root.data && root.freshTokens(root.data.summary) ? root.freshTokens(modelData)/root.freshTokens(root.data.summary) : 0); height: parent.height; radius: parent.radius; color: root.accountColor(modelData.provider,modelData.shade) }
                                         }
-                                        Sub { text: modelData.quota.limits && modelData.quota.limits.length ? (modelData.quota.limits[0].percent*100).toFixed(0)+"% limit" : ""; Layout.preferredWidth: 65; horizontalAlignment: Text.AlignRight }
-                                        Label { text: root.compact(modelData.tokens); Layout.preferredWidth: 78; horizontalAlignment: Text.AlignRight; font.pixelSize: 12 }
+                                        Sub { text: modelData.quota.limits && modelData.quota.limits.length ? (modelData.quota.limits[0].percent*100).toFixed(0)+"% used" : ""; Layout.preferredWidth: 65; horizontalAlignment: Text.AlignRight }
+                                        Label { text: root.newTokenText(modelData); Layout.preferredWidth: 90; horizontalAlignment: Text.AlignRight; font.pixelSize: 12 }
+                                        Sub { text: root.compact(root.cachedTokens(modelData)); Layout.preferredWidth: 100; horizontalAlignment: Text.AlignRight }
                                         Sub { text: root.valueText(modelData); Layout.preferredWidth: 120; horizontalAlignment: Text.AlignRight; elide: Text.ElideRight }
                                     }
                                 }
@@ -1110,14 +1133,15 @@ Scope {
                                     }
                                     Row {
                                         spacing: 10
-                                        Label { text: root.compact(modelData.tokens); font.pixelSize: 26; font.weight: Font.Medium }
-                                        Sub { text: "tokens"; anchors.bottom: parent.bottom; anchors.bottomMargin: 3 }
+                                        Label { text: root.newTokenText(modelData); font.pixelSize: 26; font.weight: Font.Medium }
+                                        Sub { text: "New tokens"; anchors.bottom: parent.bottom; anchors.bottomMargin: 3 }
                                     }
+                                    Sub { width: parent.width; wrapMode: Text.WordWrap; text: "Cache reused " + root.compact(root.cachedTokens(modelData)) + " · Total including cache " + root.compact(modelData.tokens) }
                                     Sub { width: parent.width; wrapMode: Text.WordWrap; text: root.valueText(modelData) + " API value · " + modelData.sessions + " sessions" }
                                     Sub { width: parent.width; wrapMode: Text.WordWrap; text: modelData.valueShare === null || (modelData.tokens > 0 && modelData.unpricedTokens === modelData.tokens) ? "No priced API value" : modelData.valueShare.toFixed(1)+"% of priced API value" }
-                                    Sub { width: parent.width; wrapMode: Text.WordWrap; text: modelData.sessions ? root.compact(modelData.tokensPerSession)+" tokens · "+root.money(modelData.valuePerSession)+" priced value / recorded session" : "No recorded sessions" }
+                                    Sub { width: parent.width; wrapMode: Text.WordWrap; text: modelData.sessions ? root.compact(root.freshTokens(modelData)/modelData.sessions)+" new tokens · "+root.money(modelData.valuePerSession)+" priced value / recorded session" : "No recorded sessions" }
                                     Rectangle { width: parent.width; height: 3; radius: 2; color: root.edge
-                                        Rectangle { width: parent.width*(root.data.summary.tokens ? modelData.tokens/root.data.summary.tokens : 0); height: 3; radius: 2; color: root.accountColor(modelData.provider, modelData.shade) }
+                                        Rectangle { width: parent.width*(root.freshTokens(root.data.summary) ? root.freshTokens(modelData)/root.freshTokens(root.data.summary) : 0); height: 3; radius: 2; color: root.accountColor(modelData.provider, modelData.shade) }
                                     }
                                     Sub {
                                         width: parent.width; wrapMode: Text.WordWrap
@@ -1144,7 +1168,7 @@ Scope {
                                                 text: {
                                                     var reset = root.resetText(modelData.resetsAt)
                                                     return reset.indexOf("Resets in") === 0 && typeof modelData.tokens === "number"
-                                                        ? reset + " · " + root.compact(modelData.tokens) + " tokens on this PC" : reset
+                                                        ? reset + " · " + root.compact(modelData.tokens) + " tokens incl. cache on this PC" : reset
                                                 }
                                                 width: parent.width; elide: Text.ElideRight; font.pixelSize: 10
                                             }
@@ -1152,10 +1176,9 @@ Scope {
                                     }
                                     Column {
                                         id: walletSection
-                                        // A wallet the provider reports on top of its windows:
-                                        // money left rather than a share of a cap. A balance
-                                        // that would print as $0.00 stays off the card.
-                                        visible: !!modelData.quota.balance && Math.round((modelData.quota.balance.remaining || 0) * 100) > 0
+                                        // With a known denominator, exhausted credits still
+                                        // show a full USED meter. Unmetered balances stay money.
+                                        visible: !!modelData.quota.balance && (modelData.quota.balance.funded > 0 || Math.round((modelData.quota.balance.remaining || 0) * 100) > 0)
                                         width: providerColumn.width; spacing: 4
                                         readonly property var wallet: modelData.quota.balance || ({})
                                         readonly property real spent: Math.max(0, Number(wallet.funded || 0) - Number(wallet.remaining || 0))
@@ -1167,11 +1190,11 @@ Scope {
                                         }
                                         Rectangle { visible: walletSection.wallet.funded > 0; width: parent.width; height: 4; radius: 2; color: root.edge
                                             Rectangle { height: 4; radius: 2
-                                                width: parent.width*Math.min(1,Math.max(0, walletSection.wallet.remaining/(walletSection.wallet.funded || 1)))
+                                                width: parent.width*Math.min(1,Math.max(0, walletSection.spent/(walletSection.wallet.funded || 1)))
                                                 color: walletSection.wallet.funded > 0 && walletSection.wallet.remaining/walletSection.wallet.funded <= 0.1 ? root.colorFor("claude") : Qt.alpha(root.ink,0.55) }
                                         }
                                         Sub { visible: walletSection.wallet.funded > 0
-                                              text: root.money(walletSection.spent)+" spent of "+root.money(walletSection.wallet.funded)+" funded"
+                                              text: Math.round(Math.min(1,Math.max(0,walletSection.spent/(walletSection.wallet.funded || 1)))*100)+"% used · "+root.money(walletSection.spent)+" spent of "+root.money(walletSection.wallet.funded)+" funded"
                                                     +(walletSection.wallet.estimated ? " · estimated" : "")
                                               font.pixelSize: 10 }
                                     }
@@ -1185,7 +1208,7 @@ Scope {
                                                 required property var modelData
                                                 width: providerColumn.width; spacing: 8
                                                 Sub { text: modelData.model; Layout.fillWidth: true; elide: Text.ElideRight }
-                                                Label { text: root.compact(modelData.tokens); font.pixelSize: 10 }
+                                                Label { text: root.newTokenText(modelData) + " new · " + root.compact(root.cachedTokens(modelData)) + " cache"; font.pixelSize: 10 }
                                                 Label { text: modelData.unpriced >= modelData.tokens ? "unpriced" : root.money(modelData.value); font.pixelSize: 10; color: root.muted }
                                             }
                                         }
@@ -1248,9 +1271,9 @@ Scope {
                             }
                             RowLayout { width: parent.width
                                 Sub { text: root.breakdown === "models" ? "MODEL" : root.breakdown === "projects" ? "PROJECT" : root.breakdown === "sessions" ? "SESSION / PROJECT" : root.breakdown === "routes" ? "SOURCE ROUTE" : root.breakdown === "accounts" ? "ACCOUNT" : "CLIENT"; Layout.fillWidth: true }
-                                Sub { text: "TOKENS"; Layout.preferredWidth: 95; horizontalAlignment: Text.AlignRight }
+                                Sub { text: "NEW TOKENS"; Layout.preferredWidth: 95; horizontalAlignment: Text.AlignRight }
                                 Sub { text: "API VALUE"; Layout.preferredWidth: 150; horizontalAlignment: Text.AlignRight }
-                                Sub { text: "CACHE READ"; Layout.preferredWidth: 95; horizontalAlignment: Text.AlignRight }
+                                Sub { text: "CACHE REUSED"; Layout.preferredWidth: 95; horizontalAlignment: Text.AlignRight }
                             }
                             Repeater {
                                 model: root.breakdownItems.slice(0, root.tableLimit)
@@ -1278,8 +1301,10 @@ Scope {
                                                 heading: root.breakdown === "sessions" ? modelData.project+"\n"+modelData.name : modelData.name
                                                 detail: modelData.sessions+" sessions · "+root.compact(modelData.requests)+" usage records"+(root.recordedAs(modelData) ? " · "+root.recordedAs(modelData) : "")
                                                 rows: (root.routeCount(modelData) > 1
-                                                       ? modelData.routes.map(r => ({label: r.providerName+" · "+r.model, value: root.compact(r.tokens)+" · "+root.valueText(r), color: root.colorFor(r.provider)}))
+                                                       ? modelData.routes.map(r => ({label: r.providerName+" · "+r.model, value: root.newTokenText(r)+" new · "+root.compact(root.cachedTokens(r))+" cache · "+root.valueText(r), color: root.colorFor(r.provider)}))
                                                        : []).concat([
+                                                       {label:"New tokens",value:root.newTokenText(modelData)},
+                                                       {label:"Total including cache",value:root.compact(modelData.tokens)},
                                                        {label:"Uncached input",value:root.compact(modelData.input)},
                                                        {label:"Cached input",value:root.compact(modelData.cacheRead)},
                                                        {label:"Cache writes",value:root.compact(modelData.cacheWrite)},
@@ -1289,9 +1314,9 @@ Scope {
                                             TapHandler { onTapped: root.exploreRow(modelData) }
                                         }
                                         Sub { visible: root.routeCount(modelData) > 1; text: root.routeCount(modelData)+" routes"; font.pixelSize: 10 }
-                                        Label { text: root.compact(modelData.tokens); Layout.preferredWidth: 95; horizontalAlignment: Text.AlignRight }
+                                        Label { text: root.newTokenText(modelData); Layout.preferredWidth: 95; horizontalAlignment: Text.AlignRight }
                                         Label { text: root.valueText(modelData); Layout.preferredWidth: 150; horizontalAlignment: Text.AlignRight; color: modelData.unpricedTokens ? root.colorFor("claude") : root.ink }
-                                        Sub { text: (modelData.tokens ? modelData.cacheRead/modelData.tokens*100 : 0).toFixed(1)+"%"; Layout.preferredWidth: 95; horizontalAlignment: Text.AlignRight }
+                                        Sub { text: root.compact(root.cachedTokens(modelData)); Layout.preferredWidth: 95; horizontalAlignment: Text.AlignRight }
                                     }
                                 }
                             }
@@ -1313,7 +1338,7 @@ Scope {
                             RowLayout { width: parent.width
                                 Label { text: "Activity over the past year"; font.pixelSize: 15; font.weight: Font.DemiBold }
                                 Item { Layout.fillWidth: true }
-                                Sub { text: "Darker to brighter = more tokens" }
+                                Sub { text: "Darker to brighter = more total tokens including cache" }
                             }
                             Canvas {
                                 id: heatmap
@@ -1343,7 +1368,7 @@ Scope {
                                         var d=new Date();d.setDate(d.getDate()-370+i)
                                         var key=Qt.formatDate(d,'yyyy-MM-dd')
                                         heatmap.pointerX=mouse.x;heatmap.hoverDate=key
-                                        heatmap.hoverText=i>=0&&i<371?(heatmap.activity[key]?root.compact(heatmap.activity[key])+" tokens":"No recorded activity"):""
+                                        heatmap.hoverText=i>=0&&i<371?(heatmap.activity[key]?root.compact(heatmap.activity[key])+" total tokens including cache":"No recorded activity"):""
                                     }
                                     onExited: heatmap.hoverText=""
                                 }

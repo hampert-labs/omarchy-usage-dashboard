@@ -218,6 +218,48 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(ledger.db.execute('SELECT COUNT(*) FROM events').fetchone(), (2,))
         ledger.db.close()
 
+    def test_t3_codex_originator_with_spaces_preserves_usage_identity(self):
+        def parse(originator):
+            path = self.transcript('originator.jsonl', [
+                {'type': 'session_meta', 'payload': {'id': 't3-session', 'originator': originator}},
+                self.codex_event()])
+            return list(c.codex_records(path))[0]
+        reference = parse('t3code_desktop')
+        for originator in ('T3 Code', 't3-code', 't3code_desktop'):
+            with self.subTest(originator=originator):
+                parsed = parse(originator)
+                self.assertEqual(parsed['client'], 'T3 Code')
+                self.assertEqual(parsed['id'], reference['id'])
+                self.assertEqual([parsed[f] for f in c.FIELDS], [reference[f] for f in c.FIELDS])
+        self.assertEqual(parse('codex-tui')['client'], 'CLI')
+        self.assertEqual(parse('codex_desktop')['client'], 'Desktop')
+
+    def test_t3_existing_client_labels_reindex_without_changing_tokens(self):
+        path = self.transcript('codex/sessions/t3.jsonl', [
+            {'type': 'session_meta', 'payload': {'id': 't3-session', 'originator': 'T3 Code'}},
+            self.codex_event()])
+        database = self.root / 'clients.sqlite'
+        ledger = c.Ledger(database)
+        row = list(c.codex_records(path))[0] | {'client': 'CLI'}
+        ledger.put(row, path)
+        stat = path.stat()
+        ledger.db.execute('INSERT OR REPLACE INTO files VALUES (?,?,?)', (str(path), stat.st_size, stat.st_mtime_ns))
+        ledger.db.execute("DELETE FROM metadata WHERE key='codexClientVersion'")
+        before = ledger.db.execute('SELECT id,ts,input,output,cacheRead,cacheWrite FROM events').fetchall()
+        ledger.db.commit(); ledger.db.close()
+        ledger = c.Ledger(database)
+        ledger.scan(c.DEFAULTS, local_only=True)
+        self.assertEqual(ledger.db.execute('SELECT client FROM events').fetchone()[0], 'T3 Code')
+        self.assertEqual(ledger.db.execute('SELECT id,ts,input,output,cacheRead,cacheWrite FROM events').fetchall(), before)
+        # An old remote copy must not undo the corrected local attribution.
+        ledger.put(row, 'machine:laptop/old.jsonl')
+        self.assertEqual(ledger.db.execute('SELECT client FROM events').fetchone()[0], 'T3 Code')
+        ledger.db.commit(); ledger.db.close()
+        ledger = c.Ledger(database)
+        self.assertEqual(ledger.db.execute('SELECT size,mtime FROM files WHERE path=?', (str(path),)).fetchone(),
+                         (stat.st_size, stat.st_mtime_ns))
+        ledger.db.close()
+
     def test_t3_provider_instances_are_discovered_and_routed(self):
         command_home = self.root / 't3/commandcode/codex'
         cline_data = self.root / 't3/clinepass/data'
@@ -964,6 +1006,18 @@ class CollectorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'device id'):
                 c.save_settings(c.DEFAULTS | {'ledgerDeviceId': 'x' * 81})
 
+    def test_corrected_t3_client_label_updates_synced_snapshot(self):
+        ledger = c.Ledger(self.root / 'state/usage.sqlite')
+        row = c.record('shared', 'codex', 's1', '2026-09-04T12:00:00Z', 'gpt-4.1', '/project', 'CLI', input=100)
+        ledger.put(row, self.root / 'source.jsonl')
+        cfg = c.DEFAULTS | {'ledgerSyncDir': str(self.root / 'sync'), 'ledgerDeviceId': 'desk'}
+        self.assertEqual(ledger.sync_ledgers(cfg), [])
+        ledger.put(row | {'client': 'T3 Code'}, self.root / 'source.jsonl')
+        self.assertEqual(ledger.sync_ledgers(cfg), [])
+        snapshot = sqlite3.connect(self.root / 'sync/desk.sqlite')
+        self.assertEqual(snapshot.execute('SELECT client,input FROM events').fetchone(), ('T3 Code', 100))
+        snapshot.close(); ledger.db.close()
+
     def test_synced_ledgers_export_import_and_dedupe(self):
         sync = self.root / 'sync'
         local = c.Ledger(self.root / 'state/usage.sqlite')
@@ -1182,6 +1236,63 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(r['summary']['tokens'], 300)
         self.assertEqual(r['previous']['tokens'], 50)
         self.assertTrue(r['hourly'][-1]['title'].endswith('to now'))
+        ledger.db.close()
+
+    def test_report_cache_split_preserves_inclusive_usage_and_value(self):
+        ledger = c.Ledger(self.root / 'cache-split.sqlite')
+        now = dt.datetime(2026, 9, 5, 12).astimezone()
+        row = c.record('a', 'claude', 's', '2026-09-05T10:15:00', 'm', '/project', 'Claude Code',
+                       input=2, output=20, cacheRead=300_000_000, cacheWrite=30, cacheWrite1h=10, reasoning=5)
+        ledger.put(row)
+        rates = {'document': {'m': {'input_cost_per_token': .01, 'output_cost_per_token': .02,
+                                   'cache_read_input_token_cost': .001, 'cache_creation_input_token_cost': .0125,
+                                   'cache_creation_input_token_cost_above_1hr': .02}},
+                 'source': 'test'}
+        with patch.object(c, 'load_rates', return_value=rates):
+            report = c.report(ledger, c.DEFAULTS, 1, now=now, provider='claude')
+        done = report['summary']
+        self.assertEqual(done.get('freshTokens'), 52)
+        self.assertEqual(done.get('cachedTokens'), 300_000_000)
+        self.assertEqual(done['tokens'], 300_000_052)
+        self.assertEqual(done['value'], c.price(row, rates['document'])[0])
+        for bucket in [report['providers'][0], report['cards'][0], report['models'][0],
+                       report['projects'][0], report['clients'][0], report['sessions'][0],
+                       report['hourly'][10]['total']]:
+            self.assertEqual((bucket['freshTokens'], bucket['cachedTokens']), (52, 300_000_000))
+            self.assertEqual(bucket['freshTokens'] + bucket['cachedTokens'], bucket['tokens'])
+        self.assertEqual(report['previous']['freshTokens'], 0)
+        self.assertEqual(report['previous']['cachedTokens'], 0)
+        for model in [report['cards'][0]['models'][0], report['models'][0]['routes'][0]]:
+            self.assertEqual((model.get('freshTokens'), model.get('cachedTokens')), (52, 300_000_000))
+            self.assertEqual(model['tokens'], 300_000_052)
+        ledger.db.close()
+
+    def test_hourly_snapshot_splits_cache_for_timed_and_unplaced_usage(self):
+        ledger = c.Ledger(self.root / 'panel-split.sqlite')
+        now = dt.datetime(2026, 9, 5, 12).astimezone()
+        ledger.put(c.record('timed', 'claude', 's', '2026-09-05T10:15:00', 'm', '', 'Claude Code',
+                            input=2, output=20, cacheRead=300_000_000, cacheWrite=30))
+        unplaced = c.record('unplaced', 'hermes', 's', '2026-09-05T10:20:00', 'm', '', 'Hermes',
+                            input=10, output=5, cacheRead=100, cacheWrite=5)
+        unplaced['timePrecision'] = 'session'
+        ledger.put(unplaced)
+        snapshot = c.hourly_snapshot(ledger, now)
+        self.assertEqual(snapshot.get('freshTokens'), 72)
+        self.assertEqual(snapshot.get('cachedTokens'), 300_000_100)
+        self.assertEqual(snapshot['schemaVersion'], 2)
+        self.assertEqual((snapshot['freshTimedTokens'], snapshot['cachedTimedTokens']), (52, 300_000_000))
+        self.assertEqual((snapshot['freshUnplacedTokens'], snapshot['cachedUnplacedTokens']), (20, 100))
+        self.assertEqual(snapshot['providers']['claude']['freshTokens'], 52)
+        self.assertEqual(snapshot['providers']['hermes']['cachedUnplacedTokens'], 100)
+        hour = snapshot['hours'][10]
+        self.assertEqual((hour['freshTokens'], hour['cachedTokens']), (52, 300_000_000))
+        self.assertEqual(hour['freshProviders'], {'claude': 52})
+        self.assertEqual(hour['cachedProviders'], {'claude': 300_000_000})
+        self.assertEqual(hour['providers'], {'claude': 300_000_052})
+        for b in [snapshot, *snapshot['providers'].values(), *snapshot['hours']]:
+            self.assertEqual(b['freshTokens'] + b['cachedTokens'], b['tokens'])
+        self.assertEqual(snapshot['hours'][0]['freshTokens'], 0)
+        self.assertEqual(snapshot['hours'][0]['cachedTokens'], 0)
         ledger.db.close()
 
     def test_hour_drill_keeps_session_summaries_unplaced_and_previous_day_comparable(self):

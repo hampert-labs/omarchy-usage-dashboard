@@ -27,7 +27,7 @@ Item {
     onLoaded: {
       try {
         var value = JSON.parse(text())
-        root.hourlySummary = value && value.schemaVersion === 1 ? value : null
+        root.hourlySummary = value && (value.schemaVersion === 1 || value.schemaVersion === 2) ? value : null
       } catch (e) { root.hourlySummary = null }
     }
     onLoadFailed: root.hourlySummary = null

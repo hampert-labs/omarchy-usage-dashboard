@@ -373,7 +373,7 @@ def codex_records(path, provider='codex'):
                 have_metadata = True
                 session = str(p.get('id') or p.get('session_id') or session)
                 project = p.get('cwd') or project
-                originator = str(p.get('originator') or '').casefold()
+                originator = provider_key(p.get('originator'))
                 client = 'T3 Code' if 't3code' in originator else 'Desktop' if 'desktop' in originator else 'CLI'
                 provider = CODEX_ROUTE_PROVIDERS.get(provider_key(p.get('model_provider')), provider)
                 started = timestamp(p.get('timestamp'))
@@ -908,6 +908,11 @@ class Ledger:
             if name not in columns: self.db.execute(f'ALTER TABLE events ADD COLUMN {name} {kind}')
         if 'timePrecision' not in columns:
             self.db.execute('ALTER TABLE events ADD COLUMN timePrecision TEXT')
+        if not self.db.execute("SELECT 1 FROM metadata WHERE key='codexClientVersion'").fetchone():
+            # Re-read retained transcripts once to repair T3's spaced originator
+            # label. Keep event ids and all usage; only file signatures expire.
+            self.db.execute("DELETE FROM files WHERE path LIKE '%.jsonl'")
+            self.db.execute("INSERT INTO metadata VALUES ('codexClientVersion','1')")
 
     def put(self, r, source=None, growing=False):
         if not r['ts'] or (not sum(r[f] for f in FIELDS[:4]) and not r.get('turns')): return
@@ -923,6 +928,9 @@ class Ledger:
         update += ",reportedValue=CASE WHEN excluded.provider='cursor' THEN excluded.reportedValue ELSE COALESCE(MAX(COALESCE(events.reportedValue,0),excluded.reportedValue),events.reportedValue) END"
         update += ',apiProvider=COALESCE(excluded.apiProvider,events.apiProvider)'
         update += ',timePrecision=COALESCE(excluded.timePrecision,events.timePrecision)'
+        # A corrected T3 label can arrive from a local re-read or a newer synced
+        # snapshot. An older copy labelled CLI must not undo that correction.
+        update += ",client=CASE WHEN excluded.client='T3 Code' THEN excluded.client ELSE events.client END"
         self.db.execute(f'INSERT INTO events ({",".join(keys)}) VALUES ({",".join("?" for _ in keys)}) '
                         f'ON CONFLICT(id) DO UPDATE SET {update}', list(r.values()))
         if source is not None:
@@ -941,7 +949,8 @@ class Ledger:
         except OSError:
             return ['Could not create the synced ledger folder.']
         snapshot = directory / (device + '.sqlite')
-        signature = list(self.db.execute('SELECT COUNT(*),COALESCE(MAX(ts),0),COALESCE(SUM(input+output+cacheRead+cacheWrite),0) FROM events').fetchone())
+        signature = list(self.db.execute("SELECT COUNT(*),COALESCE(MAX(ts),0),COALESCE(SUM(input+output+cacheRead+cacheWrite),0),"
+                                         "COALESCE(SUM(client='T3 Code'),0) FROM events").fetchone())
         stored = self.db.execute("SELECT value FROM metadata WHERE key='ledgerSignature'").fetchone()
         if not stored or stored[0] != json.dumps(signature):
             temporary = directory / ('.' + device + '.tmp.sqlite')
@@ -1238,7 +1247,10 @@ def add(b, r, value, savings):
 
 
 def finish(b):
-    return b | {'sessions': len(b['sessions']), 'tokensPerSession': b['tokens'] / len(b['sessions']) if b['sessions'] else None,
+    # Keep inclusive usage for pricing/quota consumers. Presentation can show
+    # new input (including cache writes) and output separately from cache reuse.
+    return b | {'freshTokens': b['tokens'] - b['cacheRead'], 'cachedTokens': b['cacheRead'],
+                'sessions': len(b['sessions']), 'tokensPerSession': b['tokens'] / len(b['sessions']) if b['sessions'] else None,
                 'valuePerSession': b['value'] / len(b['sessions']) if b['sessions'] else None}
 
 
@@ -1931,35 +1943,39 @@ def hourly_snapshot(ledger, now=None, cfg=None):
     day = now.date()
     start = int(dt.datetime.combine(day, dt.time()).timestamp())
     end = int(now.timestamp())
+    count_fields = [('tokens', 'timedTokens', 'unplacedTokens', 'providers'),
+                    ('freshTokens', 'freshTimedTokens', 'freshUnplacedTokens', 'freshProviders'),
+                    ('cachedTokens', 'cachedTimedTokens', 'cachedUnplacedTokens', 'cachedProviders')]
+    totals = {key: 0 for fields in count_fields for key in fields[:3]}
     hours = [{'start': ts, 'label': dt.datetime.fromtimestamp(ts).strftime('%H:%M'),
               'zone': dt.datetime.fromtimestamp(ts).astimezone().strftime('%Z'),
-              'tokens': 0, 'providers': {}}
+              **{key: 0 for key, *_ in count_fields}, **{fields[3]: {} for fields in count_fields}}
              for ts in range(start, end + 1, 3600)]
     providers = {}
     available_providers = [row[0] for row in ledger.db.execute('SELECT DISTINCT provider FROM events')]
-    total = timed = unplaced = 0
     ledger.db.row_factory = sqlite3.Row
     for row in ledger.db.execute('SELECT provider,client,timePrecision,ts,input,output,cacheRead,cacheWrite '
                                  'FROM events WHERE ts>=? AND ts<=?', (start, end)):
         r = dict(row)
         tokens = sum(number(r[f]) for f in FIELDS[:4])
-        p = providers.setdefault(r['provider'], {'tokens': 0, 'timedTokens': 0, 'unplacedTokens': 0})
-        total += tokens
-        p['tokens'] += tokens
-        if not timed_event(r):
-            unplaced += tokens
-            p['unplacedTokens'] += tokens
-            continue
+        cached = number(r['cacheRead'])
+        p = providers.setdefault(r['provider'], {key: 0 for key in totals})
         index = int((r['ts'] - start) // 3600)
-        if 0 <= index < len(hours):
-            timed += tokens
-            p['timedTokens'] += tokens
-            hours[index]['tokens'] += tokens
-            by_provider = hours[index]['providers']
-            by_provider[r['provider']] = by_provider.get(r['provider'], 0) + tokens
-    return {'schemaVersion': 1, 'date': str(day), 'generatedAt': now.timestamp(),
+        for (total_key, timed_key, unplaced_key, provider_key), amount in zip(count_fields, (tokens, tokens - cached, cached)):
+            totals[total_key] += amount
+            p[total_key] += amount
+            if not timed_event(r):
+                totals[unplaced_key] += amount
+                p[unplaced_key] += amount
+            elif 0 <= index < len(hours):
+                totals[timed_key] += amount
+                p[timed_key] += amount
+                hours[index][total_key] += amount
+                by_provider = hours[index][provider_key]
+                by_provider[r['provider']] = by_provider.get(r['provider'], 0) + amount
+    return {'schemaVersion': 2, 'date': str(day), 'generatedAt': now.timestamp(),
             'timeZone': now.tzname() or '', 'utcOffsetMinutes': int(now.utcoffset().total_seconds() // 60),
-            'tokens': total, 'timedTokens': timed, 'unplacedTokens': unplaced,
+            **totals,
             'availableProviders': available_providers, 'providers': providers, 'hours': hours,
             # Local tokens in each record's current limit windows, keyed by
             # record id. The panel matches them to its limits by label and
@@ -2068,9 +2084,11 @@ def report(ledger, cfg, days=7, provider='all', now=None, selection=None):
         provider_accounts[p].add(account)
         card_id = p + ':' + account
         model_entry = card_models_agg.setdefault(card_id, {}).setdefault(r['model'],
-            {'model': r['model'], 'tokens': 0, 'value': 0.0, 'unpriced': 0})
+            {'model': r['model'], 'tokens': 0, 'freshTokens': 0, 'cachedTokens': 0, 'value': 0.0, 'unpriced': 0})
         model_tokens = sum(r[f] for f in FIELDS[:4])
         model_entry['tokens'] += model_tokens
+        model_entry['freshTokens'] += model_tokens - r['cacheRead']
+        model_entry['cachedTokens'] += r['cacheRead']
         if value is None: model_entry['unpriced'] += model_tokens
         else: model_entry['value'] += value
         if day in daily:
@@ -2238,6 +2256,7 @@ def report(ledger, cfg, days=7, provider='all', now=None, selection=None):
             route_rows.append({'provider': p, 'providerName': PROVIDERS.get(p, p),
                                'model': ', '.join(sorted(route['models'])),
                                'tokens': done['tokens'], 'value': done['value'],
+                               'freshTokens': done['freshTokens'], 'cachedTokens': done['cachedTokens'],
                                'unpricedTokens': done['unpricedTokens'], 'sessions': done['sessions']})
         route_rows.sort(key=lambda item: item['tokens'], reverse=True)
         model_rows.append(finish(b) | {'name': name, 'provider': route_rows[0]['provider'] if route_rows else '', 'routes': route_rows})

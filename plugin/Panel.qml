@@ -160,7 +160,7 @@ Panel {
   property double nowMs: Date.now()
 
   readonly property var limits: limitWindows(provider)
-  readonly property var models: modelRows(providers)
+  readonly property var models: modelRows(allSelected ? providers : (provider ? [provider] : []))
   readonly property var headline: bindingWindow(provider)
   readonly property var balance: provider ? (provider.balance || null) : null
   // Banked resets a provider grants for clearing a rate limit window early.
@@ -195,7 +195,7 @@ Panel {
 
   function hourlyData() {
     var data = usage.hourlySummary
-    return data && data.date === todayDate() && data.schemaVersion === 1
+    return data && data.date === todayDate() && (data.schemaVersion === 1 || data.schemaVersion === 2)
       && Number(data.utcOffsetMinutes) === -new Date(root.nowMs).getTimezoneOffset() ? data : null
   }
 
@@ -212,14 +212,47 @@ Panel {
 
   function hourlyAvailable() {
     var data = hourlyData()
-    return !!data && hourlyIds().some(function(id) { return (data.availableProviders || []).indexOf(id) >= 0 })
+    if (!data) return false
+    var ids = hourlyIds().filter(function(id) { return (data.availableProviders || []).indexOf(id) >= 0 })
+    return ids.length > 0 && ids.every(function(id) {
+      var bucket = (data.providers || {})[id] || {}
+      return splitFresh(bucket) !== null && splitCached(bucket) !== null
+    }) && (data.hours || []).every(function(hour) {
+      return ids.every(function(id) { return hourFresh(hour, id) !== null && hourCached(hour, id) !== null })
+    })
+  }
+
+  function splitCached(bucket) {
+    return typeof bucket.cachedTokens === "number" ? bucket.cachedTokens
+      : typeof bucket.cacheRead === "number" ? bucket.cacheRead : null
+  }
+
+  function splitFresh(bucket) {
+    if (typeof bucket.freshTokens === "number") return bucket.freshTokens
+    var cached = splitCached(bucket)
+    return cached === null ? null : Math.max(0, Number(bucket.tokens || 0) - cached)
+  }
+
+  function hourCached(hour, id) {
+    var map = hour.cachedProviders || hour.cacheReadProviders
+    return map ? Number(map[id] || 0) : null
+  }
+
+  function hourFresh(hour, id) {
+    if (hour.freshProviders) return Number(hour.freshProviders[id] || 0)
+    var cached = hourCached(hour, id)
+    return cached === null ? null : Math.max(0, Number((hour.providers || {})[id] || 0) - cached)
   }
 
   function hourlyTotal(field) {
     var data = hourlyData()
     if (!data) return 0
     var ids = hourlyIds(), sum = 0
-    for (var i = 0; i < ids.length; i++) sum += Number((data.providers[ids[i]] || {})[field] || 0)
+    for (var i = 0; i < ids.length; i++) {
+      var bucket = (data.providers || {})[ids[i]] || {}
+      sum += field === "freshTokens" ? splitFresh(bucket) || 0
+           : field === "cachedTokens" ? splitCached(bucket) || 0 : Number(bucket[field] || 0)
+    }
     return sum
   }
 
@@ -228,11 +261,15 @@ Panel {
     if (!data || !hourlyAvailable()) return []
     var ids = hourlyIds()
     return data.hours.slice(-6).reverse().map(function(hour) {
-      var value = 0
-      for (var i = 0; i < ids.length; i++) value += Number((hour.providers || {})[ids[i]] || 0)
+      var value = 0, cached = 0, total = 0
+      for (var i = 0; i < ids.length; i++) {
+        value += hourFresh(hour, ids[i])
+        cached += hourCached(hour, ids[i])
+        total += Number((hour.providers || {})[ids[i]] || 0)
+      }
       var repeated = data.hours.some(function(other) { return other.start !== hour.start && other.label === hour.label })
       var label = Qt.formatDateTime(new Date(Number(hour.start) * 1000), root.shortTimePattern)
-      return { label: repeated ? label + " " + hour.zone : label, start: hour.start, tokens: value }
+      return { label: repeated ? label + " " + hour.zone : label, start: hour.start, tokens: value, cachedTokens: cached, totalTokens: total }
     })
   }
 
@@ -466,7 +503,8 @@ Panel {
     // up to the cent instead of rounding apart.
     var spent = Number(b.funded) - Number(b.remaining)
     if (!isFinite(spent) || spent < 0) spent = Number(b.spent) || 0
-    var text = formatMoney(spent, b.currency) + " spent of " + formatMoney(b.funded, b.currency) + " funded"
+    var usedPercent = Math.round(clamp(1 - Number(b.remaining) / Number(b.funded), 0, 1) * 100)
+    var text = usedPercent + "% used · " + formatMoney(spent, b.currency) + " spent of " + formatMoney(b.funded, b.currency) + " funded"
     if (b.estimated) text += " · estimated"
     return text
   }
@@ -559,16 +597,20 @@ Panel {
     var rows = []
     for (var family in totals) {
       var item = totals[family]
+      item.fresh = item.input + item.output + item.cacheWrite
       item.total = item.input + item.output + item.cacheRead + item.cacheWrite
       rows.push(item)
     }
-    rows.sort(function(a, b) { return b.total - a.total })
+    rows.sort(function(a, b) { return b.fresh - a.fresh || b.cacheRead - a.cacheRead })
     return rows.slice(0, 4)
   }
 
   function modelTooltip(row) {
     if (!row) return ""
-    return "In " + usage.formatTokenCount(row.input)
+    return "New tokens " + usage.formatTokenCount(row.fresh)
+      + " · Cache reused " + usage.formatTokenCount(row.cacheRead)
+      + " · Total including cache " + Number(row.total).toLocaleString(Qt.locale("en_US"), "f", 0)
+      + "\nIn " + usage.formatTokenCount(row.input)
       + " · out " + usage.formatTokenCount(row.output)
       + " · cache read " + usage.formatTokenCount(row.cacheRead)
       + " · cache write " + usage.formatTokenCount(row.cacheWrite)
@@ -702,7 +744,7 @@ Panel {
           }
         }
         Text {
-          text: Math.round(modelData.percent * 100) + "%"
+          text: Math.round(modelData.percent * 100) + "% used"
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.space(11)
@@ -914,7 +956,7 @@ Panel {
               width: parent.width
               dataReady: root.hourlyAvailable()
               visible: dataReady
-              targetTokens: root.hourlyTotal("tokens")
+              targetTokens: root.hourlyTotal("freshTokens")
               scopeKey: (root.allSelected ? "all" : "other") + "|" + root.todayDate()
               animateChanges: root.opened && root.allSelected
               color: root.foreground
@@ -924,13 +966,22 @@ Panel {
             }
             Text {
               width: parent.width
-              text: root.hourlyAvailable() ? "Processed tokens today · updates as agents record usage"
-                                           : "Reading local token history"
+              text: root.hourlyAvailable() ? "New tokens today · input + cache writes + output"
+                                           : root.hourlyData() ? "Waiting for updated cache split" : "Reading local token history"
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
             }
+          }
+
+          Text {
+            visible: root.allSelected && root.hourlyAvailable()
+            width: parent.width
+            text: "Cache reused " + usage.formatTokenCount(root.hourlyTotal("cachedTokens"))
+              + " · Total including cache " + usage.formatTokenCount(root.hourlyTotal("tokens"))
+            color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
           }
 
           Column {
@@ -974,7 +1025,7 @@ Panel {
                     Layout.fillWidth: true
                   }
                   Text {
-                    text: limit ? Math.round(limit.percent * 100) + "%" : "—"
+                    text: limit ? Math.round(limit.percent * 100) + "% used" : "—"
                     color: limit && limit.percent >= 0.9 ? root.urgent : root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -1140,10 +1191,10 @@ Panel {
             width: parent.width
             spacing: Style.space(10)
 
-            // The meter shows what is left, not what is used: a prepaid
-            // account drains toward empty rather than filling toward a cap.
+            // Match allowance meters: fill grows with the funded credits used.
+            // No denominator means no percentage; the currency balance remains.
             readonly property real ratio: root.balance && root.balance.funded > 0
-              ? root.clamp(root.balance.remaining / root.balance.funded, 0, 1)
+              ? root.clamp(1 - root.balance.remaining / root.balance.funded, 0, 1)
               : -1
 
             PanelSectionHeader {
@@ -1256,19 +1307,34 @@ Panel {
 
             PanelSectionHeader {
               width: parent.width
-              text: "LATEST 6 HOURS · TODAY"
+              text: "NEW TOKENS · LATEST 6 HOURS"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
             Text {
               visible: !root.allSelected
               width: parent.width
-              text: root.hourlyAvailable() ? Number(root.hourlyTotal("tokens")).toLocaleString(Qt.locale("en_US"), "f", 0) + " processed tokens today"
-                                           : root.hourlyData() ? "No indexed token history for this source" : "Hourly history is loading"
+              text: root.hourlyAvailable() ? Number(root.hourlyTotal("freshTokens")).toLocaleString(Qt.locale("en_US"), "f", 0) + " new tokens today"
+                                           : root.hourlyData() ? "Waiting for updated cache split" : "Hourly history is loading"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
               font.bold: true
+            }
+            Text {
+              visible: root.hourlyAvailable()
+              width: parent.width
+              text: "Cache reused " + usage.formatTokenCount(root.hourlyTotal("cachedTokens"))
+                + " · Total including cache " + usage.formatTokenCount(root.hourlyTotal("tokens"))
+              color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            Text {
+              visible: root.allSelected && !!root.hourlyData() && !root.hourlyAvailable()
+              width: parent.width
+              text: "Waiting for updated cache split"
+              color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
             }
             Repeater {
               model: hourlySection.rows
@@ -1291,10 +1357,10 @@ Panel {
               wrapMode: Text.WordWrap
             }
             Text {
-              visible: root.hourlyTotal("unplacedTokens") > 0
+              visible: root.hourlyAvailable() && root.hourlyTotal("unplacedTokens") > 0
               width: parent.width
-              text: Number(root.hourlyTotal("unplacedTokens")).toLocaleString(Qt.locale("en_US"), "f", 0)
-                    + " session-summary tokens have no exact hour"
+              text: usage.formatTokenCount(root.hourlyTotal("freshUnplacedTokens")) + " new · "
+                    + usage.formatTokenCount(root.hourlyTotal("cachedUnplacedTokens")) + " reused session-summary tokens have no exact hour"
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -1329,7 +1395,7 @@ Panel {
 
             PanelSectionHeader {
               width: parent.width
-              text: "TOKENS BY DAY"
+              text: "TOTAL TOKENS INCLUDING CACHE · BY DAY"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
@@ -1365,7 +1431,7 @@ Panel {
 
             PanelSectionHeader {
               width: parent.width
-              text: "TOKENS BY MODEL · ALL ROUTES"
+              text: "NEW TOKENS / CACHE REUSED · MODELS"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
@@ -1377,7 +1443,7 @@ Panel {
                 required property var modelData
                 width: modelSection.width
                 row: modelData
-                share: modelData.total / Math.max(1, root.models[0].total)
+                share: modelData.fresh / Math.max(1, root.models[0].fresh)
               }
             }
           }
@@ -1433,7 +1499,7 @@ Panel {
         id: limitValue
         textFormat: Text.PlainText
         text: limitRow.window && limitRow.window.percent >= 0
-          ? Math.round(limitRow.window.percent * 100) + "%"
+          ? Math.round(limitRow.window.percent * 100) + "% used"
           : "—"
         color: limitRow.alarming ? root.urgent : root.foreground
         font.family: root.fontFamily
@@ -1475,7 +1541,7 @@ Panel {
         if (!(remainingMs > 0)) return ""
         var tokens = root.provider ? root.windowTokens(root.provider.providerId, limitRow.window) : -1
         return "Resets in " + root.formatDuration(remainingMs)
-          + (tokens >= 0 ? " · " + usage.formatTokenCount(tokens) + " tokens on this PC" : "")
+          + (tokens >= 0 ? " · " + usage.formatTokenCount(tokens) + " tokens incl. cache on this PC" : "")
       }
       elide: Text.ElideRight
       color: root.dim
@@ -1523,7 +1589,7 @@ Panel {
     property real ratio: 0
     property bool current: false
     implicitHeight: Math.max(hourLabel.implicitHeight, hourValue.implicitHeight) + Style.spacing.sm
-    Accessible.name: (hour ? hour.label : "") + ", " + (hour ? Number(hour.tokens || 0).toLocaleString(Qt.locale("en_US"), "f", 0) : "0") + " tokens"
+    Accessible.name: (hour ? hour.label : "") + ", " + (hour ? Number(hour.tokens || 0).toLocaleString(Qt.locale("en_US"), "f", 0) : "0") + " new tokens, " + (hour ? usage.formatTokenCount(hour.cachedTokens) : "0") + " cache reused"
 
     Text {
       id: hourLabel
@@ -1554,7 +1620,7 @@ Panel {
     }
     Text {
       id: hourValue
-      text: hourRow.hour ? Number(hourRow.hour.tokens || 0).toLocaleString(Qt.locale("en_US"), "f", 0) : "0"
+      text: hourRow.hour ? usage.formatTokenCount(hourRow.hour.tokens) + " new\n" + usage.formatTokenCount(hourRow.hour.cachedTokens) + " cache" : "0"
       color: hourRow.current ? root.foreground : root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
@@ -1563,6 +1629,14 @@ Panel {
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
       width: Style.space(90)
+    }
+    MouseArea { id: hourHover; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
+    PanelToolTip {
+      visible: hourHover.containsMouse
+      text: hourRow.hour ? "New tokens " + usage.formatTokenCount(hourRow.hour.tokens)
+        + " · Cache reused " + usage.formatTokenCount(hourRow.hour.cachedTokens)
+        + " · Total including cache " + Number(hourRow.hour.totalTokens).toLocaleString(Qt.locale("en_US"), "f", 0) : ""
+      fontFamily: root.fontFamily
     }
   }
 
@@ -1684,7 +1758,7 @@ Panel {
     Text {
       id: modelTokens
       textFormat: Text.PlainText
-      text: modelRow.row ? usage.formatTokenCount(modelRow.row.total) : ""
+      text: modelRow.row ? usage.formatTokenCount(modelRow.row.fresh) + " new · " + usage.formatTokenCount(modelRow.row.cacheRead) + " cache" : ""
       color: root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall

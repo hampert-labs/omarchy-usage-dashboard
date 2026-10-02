@@ -24,10 +24,10 @@ Item {
     readonly property var topSources: {
         var totals = {}
         for (var h of hours) for (var id in h.providers || {})
-            totals[id] = (totals[id] || 0) + Number(h.providers[id].tokens || 0)
+            totals[id] = (totals[id] || 0) + Number(freshTokens(h.providers[id]) || 0)
         return Object.keys(totals).sort((a, b) => totals[b] - totals[a]).slice(0, 4)
     }
-    readonly property var shown: expanded ? descending : descending.filter(h => h.title.endsWith("to now") || amount(h.total) > 0).slice(0, 10)
+    readonly property var shown: expanded ? descending : descending.filter(h => h.title.endsWith("to now") || Number(h.total.tokens || 0) > 0).slice(0, 10)
     readonly property real peak: {
         var value = 1
         for (var i = 0; i < hours.length; i++) value = Math.max(value, amount(hours[i].total))
@@ -35,8 +35,21 @@ Item {
     }
     implicitHeight: content.implicitHeight
 
-    function amount(bucket) { return Number(bucket ? (metric === "tokens" ? bucket.tokens : bucket.value) : 0) || 0 }
+    function freshTokens(bucket) {
+        if (!bucket) return 0
+        if (typeof bucket.freshTokens === "number") return bucket.freshTokens
+        var cached = cachedTokens(bucket)
+        return cached === null ? null : Math.max(0, Number(bucket.tokens || 0) - cached)
+    }
+    function cachedTokens(bucket) {
+        if (!bucket) return 0
+        return typeof bucket.cachedTokens === "number" ? bucket.cachedTokens
+             : typeof bucket.cacheRead === "number" ? bucket.cacheRead : null
+    }
+    function count(value) { return value === null ? "—" : Number(value || 0).toLocaleString(Qt.locale("en_US"), "f", 0) }
+    function amount(bucket) { return Number(bucket ? (metric === "tokens" ? freshTokens(bucket) : bucket.value) : 0) || 0 }
     function exact(bucket) {
+        if (metric === "tokens" && freshTokens(bucket) === null) return "—"
         var value = amount(bucket)
         return metric === "tokens" ? Math.round(value).toLocaleString(Qt.locale("en_US"), "f", 0)
                                    : "$" + value.toLocaleString(Qt.locale("en_US"), "f", 2)
@@ -46,11 +59,11 @@ Item {
         return duplicate ? formatHourTitle(hour).split(" to ")[0] : formatHour(hour.start)
     }
     function segments(hour) {
-        var total = Number(hour.total ? hour.total.tokens : 0)
+        var total = Number(freshTokens(hour.total) || 0)
         if (!total) return []
-        var rows = topSources.map(id => ({id: id, tokens: Number((hour.providers || {})[id] ? hour.providers[id].tokens : 0)}))
+        var rows = topSources.map(id => ({id: id, tokens: Number(freshTokens((hour.providers || {})[id]) || 0)}))
         var rest = Object.keys(hour.providers || {}).filter(id => topSources.indexOf(id) < 0)
-            .reduce((sum, id) => sum + Number(hour.providers[id].tokens || 0), 0)
+            .reduce((sum, id) => sum + Number(freshTokens(hour.providers[id]) || 0), 0)
         if (rest) rows.push({id: "other", tokens: rest})
         return rows
     }
@@ -63,8 +76,8 @@ Item {
         Text {
             visible: root.unplaced.total && root.unplaced.total.tokens > 0
             width: parent.width; bottomPadding: 5
-            text: Number(root.unplaced.total.tokens || 0).toLocaleString(Qt.locale("en_US"), "f", 0)
-                  + " session-summary tokens cannot be assigned to an exact hour"
+            text: root.count(root.freshTokens(root.unplaced.total)) + " new · " + root.count(root.cachedTokens(root.unplaced.total))
+                  + " reused session-summary tokens cannot be assigned to an exact hour"
             color: root.muted; font.family: root.fontFamily; font.pixelSize: 11
             wrapMode: Text.WordWrap
         }
@@ -90,6 +103,13 @@ Item {
         }
 
         Text {
+            visible: root.metric === "tokens" && root.hours.some(h => root.freshTokens(h.total) === null)
+            text: "Waiting for updated cache split"
+            color: root.muted; font.family: root.fontFamily; font.pixelSize: 12
+            width: parent.width; wrapMode: Text.WordWrap
+        }
+
+        Text {
             visible: !root.expanded && root.descending.length > root.shown.length
             text: "Hours with activity, plus the current hour when applicable · local time"
             color: root.muted; font.family: root.fontFamily; font.pixelSize: 11
@@ -111,8 +131,13 @@ Item {
                 width: content.width
                 implicitHeight: 38
                 Accessible.name: root.hourLabel(modelData) + ", " + root.exact(modelData.total)
+                    + (root.metric === "tokens" ? " new tokens, " + root.count(root.cachedTokens(modelData.total)) + " cache reused" : " API value")
                     + (modelData.title.endsWith("to now") ? ", current hour" : "")
                 onClicked: root.hourSelected(Number(modelData.start))
+                ToolTip.visible: hovered
+                ToolTip.text: "New tokens " + root.count(root.freshTokens(modelData.total))
+                    + " · Cache reused " + root.count(root.cachedTokens(modelData.total))
+                    + " · Total including cache " + root.count(modelData.total.tokens)
                 background: Rectangle {
                     radius: 3
                     color: hourRow.down || Number(hourRow.modelData.start) === root.selectedHour
@@ -140,7 +165,7 @@ Item {
                                     required property var modelData
                                     height: 9
                                     width: root.metric === "tokens"
-                                        ? parent.width * modelData.tokens / Math.max(1, hourRow.modelData.total.tokens)
+                                        ? parent.width * modelData.tokens / Math.max(1, root.amount(hourRow.modelData.total))
                                         : parent.width
                                     color: modelData.id === "other" ? root.muted
                                            : modelData.id === "value" ? root.accent : root.sourceColor(modelData.id)
@@ -149,10 +174,17 @@ Item {
                         }
                     }
                     Text {
-                        text: root.exact(hourRow.modelData.total)
+                        text: root.exact(hourRow.modelData.total) + (root.metric === "tokens" ? " new" : "")
                         color: root.ink; font.family: root.fontFamily; font.pixelSize: 12
                         horizontalAlignment: Text.AlignRight
                         Layout.preferredWidth: 118
+                    }
+                    Text {
+                        visible: root.metric === "tokens"
+                        text: root.count(root.cachedTokens(hourRow.modelData.total)) + " cache"
+                        color: root.muted; font.family: root.fontFamily; font.pixelSize: 11
+                        horizontalAlignment: Text.AlignRight
+                        Layout.preferredWidth: 160
                     }
                 }
             }
