@@ -1390,6 +1390,72 @@ class CollectorTests(unittest.TestCase):
         record=c.record('x','codex','s',1,'gpt-4.1','','CLI',input=100,output=10)
         self.assertIsNotNone(c.price(record,rates['document'])[0])
 
+    def openclaw_ledger(self, events, agent='main', windows=(('w1', None, 'webchat', 'agent:main:main'),)):
+        path = self.root / '.openclaw/agents' / agent / 'agent/openclaw-agent.sqlite'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(path)
+        db.execute('CREATE TABLE session_windows (session_id TEXT PRIMARY KEY, agent_harness_id TEXT, channel TEXT, session_key TEXT)')
+        db.execute('CREATE TABLE transcript_events (session_id TEXT, seq INTEGER, event_json TEXT, created_at INTEGER, '
+                   'event_zstd BLOB, event_utf8_bytes INTEGER, navigation_json TEXT, PRIMARY KEY (session_id, seq))')
+        db.executemany('INSERT INTO session_windows VALUES (?,?,?,?)', windows)
+        from compression import zstd
+        for seq, (session, event, packed) in enumerate(events):
+            text = json.dumps(event)
+            db.execute('INSERT INTO transcript_events VALUES (?,?,?,?,?,?,?)',
+                       (session, seq, None if packed else text, 1789000000000,
+                        zstd.compress(text.encode()) if packed else None, len(text) if packed else None, None))
+        db.commit(); db.close()
+        return path
+
+    @staticmethod
+    def openclaw_turn(entry_id, usage, harness=None, model='gpt-6-astra'):
+        message = {'role': 'assistant', 'provider': 'openai', 'model': model, 'timestamp': 1789000100000, 'usage': usage}
+        if harness: message['agentHarnessId'] = harness
+        return {'type': 'message', 'id': entry_id, 'message': message}
+
+    def test_openclaw_native_and_codex_runtime_turns_count_once_with_uncached_input(self):
+        native = {'input': 800, 'output': 120, 'cacheRead': 4864, 'cacheWrite': 0, 'totalTokens': 5784}
+        # The Codex runtime mirror may carry Codex's cached-inclusive input:
+        # its total is input + output, so the cached part comes out once.
+        mirrored = {'input': 5738, 'output': 5, 'cacheRead': 4864, 'cacheWrite': 0, 'totalTokens': 5743}
+        path = self.openclaw_ledger([
+            ('w1', {'type': 'message', 'id': 'u1', 'message': {'role': 'user', 'content': 'hoi'}}, False),
+            ('w1', self.openclaw_turn('a1', native), False),
+            ('w1', self.openclaw_turn('a2', mirrored, harness='codex'), True),
+            ('w1', self.openclaw_turn('m1', {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0, 'totalTokens': 0},
+                                      model='delivery-mirror'), False),
+            # A fork copies the entry into another window with the same id.
+            ('w2', self.openclaw_turn('a1', native), False)],
+            windows=(('w1', None, 'webchat', 'agent:main:main'), ('w2', None, 'webchat', 'agent:main:fork')))
+        rows = list(c.openclaw_records(path))
+        self.assertEqual(len(rows), 3)
+        first, second = rows[0], rows[1]
+        self.assertEqual((first['provider'], first['client'], first['model'], first['apiProvider'], first['project']),
+                         ('openclaw', 'OpenClaw', 'gpt-6-astra', 'openai', 'webchat'))
+        self.assertEqual((first['input'], first['cacheRead'], first['output']), (800, 4864, 120))
+        self.assertEqual(second['client'], 'OpenClaw · Codex')
+        self.assertEqual((second['input'], second['cacheRead'], second['output']), (874, 4864, 5))
+        self.assertEqual(rows[2]['id'], first['id'])
+        ledger = c.Ledger(self.root / 'openclaw.sqlite')
+        for row in rows: ledger.put(row, path)
+        self.assertEqual(ledger.db.execute('SELECT COUNT(*), SUM(input) FROM events').fetchone(), (2, 1674))
+
+    def test_openclaw_scan_reads_every_agent_and_ignores_codex_home_rollouts(self):
+        self.openclaw_ledger([('w1', self.openclaw_turn('a1', {'input': 10, 'output': 2, 'totalTokens': 12}), False)])
+        self.openclaw_ledger([('w1', self.openclaw_turn('b1', {'input': 30, 'output': 4, 'totalTokens': 34}), False)],
+                             agent='work')
+        # The Codex runtime's own rollouts live under the agent folder and are
+        # mirrored into the transcript above; scanning them would count twice.
+        rollout = self.root / '.openclaw/agents/main/agent/codex-home/sessions/2026/10/02/rollout.jsonl'
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text('{"type":"event_msg","payload":{"type":"token_count"}}\n')
+        ledger = c.Ledger(self.root / 'ledger.sqlite')
+        meta = ledger.scan(c.DEFAULTS)
+        self.assertEqual(ledger.db.execute("SELECT COUNT(*), SUM(input) FROM events WHERE provider='openclaw'").fetchone(), (2, 40))
+        self.assertEqual(ledger.db.execute("SELECT COUNT(*) FROM events WHERE provider='codex'").fetchone(), (0,))
+        source = [s for s in meta['sources'] if s['provider'] == 'openclaw'][0]
+        self.assertEqual((source['files'], source['status']), (2, 'available'))
+
     def hermes_ledger(self, rows, name='hermes/state.db', sessions=None):
         path = self.root / name
         path.parent.mkdir(parents=True, exist_ok=True)

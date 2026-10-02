@@ -32,9 +32,9 @@ MAX_PINNED_LIMITS = 3
 PROVIDERS = {'codex': 'Codex', 'claude': 'Claude', 'opencode-go': 'OpenCode Go', 'grok': 'Grok Build',
              'gemini': 'Gemini CLI', 'opencode': 'OpenCode', 'pi': 'Pi', 'omp': 'Oh My Pi', 'muse': 'Muse',
              'ollama-cloud': 'Ollama Cloud', 'commandcode': 'CommandCode',
-             'clinepass': 'ClinePass', 'cursor': 'Cursor', 'hermes': 'Hermes Agent'}
+             'clinepass': 'ClinePass', 'cursor': 'Cursor', 'hermes': 'Hermes Agent', 'openclaw': 'OpenClaw'}
 HOME_KEYS = ('codexHomes', 'claudeHomes', 'grokHomes', 'geminiHomes', 'opencodeHomes', 'piHomes', 'ompHomes',
-             'museHomes', 'commandcodeHomes', 'hermesHomes')
+             'museHomes', 'commandcodeHomes', 'hermesHomes', 'openclawHomes')
 # Provider ids used by the Hermes agent's own per-model usage table. Hermes
 # bills the same routes this dashboard reads elsewhere, so its ledger is a
 # source, not a separate provider. Two of these are the same product reached
@@ -803,6 +803,71 @@ def opencode_record(mid, sid, ts, project, model, route, usage, cost, provider='
     return r
 
 
+def openclaw_ledgers(root):
+    """Per-agent OpenClaw databases under a state dir (~/.openclaw by default)."""
+    return sorted(Path(root).expanduser().glob('agents/*/agent/openclaw-agent.sqlite'))
+
+
+def openclaw_event(row):
+    """One transcript_events row as a dict; large events are stored zstd-compressed."""
+    raw, packed = row
+    if raw is None and packed is not None:
+        from compression import zstd
+        raw = zstd.decompress(packed).decode()
+    return json.loads(raw) if raw else {}
+
+
+def openclaw_records(path):
+    """Assistant turns with usage from one OpenClaw agent database.
+
+    Both runtimes land here. The built-in runtime calls the model itself; the
+    Codex runtime runs `codex app-server` with its own CODEX_HOME under the
+    agent folder (not ~/.codex, which the codex scanner reads) and mirrors each
+    turn into this transcript, so this is the one place to count OpenClaw.
+    OpenClaw keeps input uncached (prompt = input + cacheRead + cacheWrite). A
+    mirrored Codex turn whose total equals input + output carries Codex's own
+    cached-inclusive input, so the cached part is taken out once here.
+    """
+    agent = Path(path).parent.parent.name
+    conn = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True, timeout=3)
+    try:
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(transcript_events)')}
+        if not {'session_id', 'seq', 'event_json', 'event_zstd', 'created_at'} <= columns:
+            raise ValueError('Not an OpenClaw agent database')
+        try:
+            windows = {r[0]: r[1:] for r in conn.execute(
+                'SELECT session_id, agent_harness_id, channel, session_key FROM session_windows')}
+        except sqlite3.Error: windows = {}
+        for session, seq, created, *packed in conn.execute(
+                'SELECT session_id, seq, created_at, event_json, event_zstd FROM transcript_events ORDER BY session_id, seq'):
+            event = openclaw_event(packed)
+            message = event.get('message') if isinstance(event.get('message'), dict) else event
+            usage = message.get('usage')
+            if message.get('role') != 'assistant' or not isinstance(usage, dict): continue
+            harness, channel, session_key = windows.get(session, (None, None, None))
+            harness = message.get('agentHarnessId') or event.get('agentHarnessId') or harness or 'openclaw'
+            uncached, cached = number(usage.get('input')), number(usage.get('cacheRead'))
+            output, written = number(usage.get('output')), number(usage.get('cacheWrite'))
+            # Delivery mirrors (a reply copied to a channel) carry an all-zero usage block.
+            if not (uncached or output or cached or written): continue
+            if cached and number(usage.get('totalTokens')) == uncached + output and uncached >= cached:
+                uncached -= cached
+            # A fork or rollover copies earlier entries into a new window; the
+            # entry id (or the provider's response id) stays the same, so the
+            # copy collapses onto the original instead of counting twice.
+            key = message.get('responseId') or event.get('id') or f'{session}:{seq}'
+            entry = record(digest('openclaw', agent, key), 'openclaw', str(session_key or session),
+                           message.get('timestamp') or event.get('timestamp') or created,
+                           message.get('model'), channel or '',
+                           'OpenClaw' if harness in ('openclaw', 'pi') else 'OpenClaw · ' + harness.capitalize(),
+                           input=uncached, output=output, cacheRead=cached, cacheWrite=written,
+                           reasoning=usage.get('reasoningTokens'))
+            entry['apiProvider'] = message.get('provider') or ''
+            yield entry
+    finally:
+        conn.close()
+
+
 def hermes_ledger_path(root):
     return Path(root).expanduser() / 'state.db'
 
@@ -1112,6 +1177,20 @@ class Ledger:
             except (sqlite3.Error, ValueError, TypeError, AttributeError, KeyError):
                 source['readErrors'] = 1
                 warnings.append('Hermes database could not be read; retained previous records.')
+        openclaw_roots = [os.getenv('OPENCLAW_STATE_DIR', str(HOME / '.openclaw'))] + cfg.get('openclawHomes', [])
+        for root in sorted({str(Path(r).expanduser()) for r in openclaw_roots}):
+            paths = openclaw_ledgers(root)
+            source = {'provider': 'openclaw', 'path': str(Path(root) / 'agents'), 'files': len(paths),
+                      'exists': bool(paths), 'kind': 'database', 'clients': ['OpenClaw']}
+            sources.append(source)
+            for path in paths:
+                if local_only and not self.database_changed(path): continue
+                try:
+                    for entry in openclaw_records(path): self.put(entry, path.resolve())
+                    if local_only: self.remember_database(path)
+                except (sqlite3.Error, ValueError, TypeError, AttributeError, KeyError, OSError):
+                    source['readErrors'] = source.get('readErrors', 0) + 1
+                    warnings.append(f'OpenClaw database {path.parent.parent.name} could not be read; retained previous records.')
 
         if not local_only and 'cursor' in cfg.get('enabled', []) and os.getenv('AI_USAGE_DEMO') != '1':
             csource, cwarnings = cursor_usage(self, force=force)
