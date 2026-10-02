@@ -412,6 +412,9 @@ def claude_records(path, provider='claude'):
             msg_id = m.get('id') or item.get('uuid')
             key = digest('claude', msg_id, item.get('requestId')) if msg_id else digest('claude', session, item.get('timestamp'), u)
             client = 'Claude Code' if provider == 'claude' else PROVIDERS[provider]
+            # OpenClaw's claude-cli runtime runs Claude Code in its workspace; the
+            # turn is billed here, on the Claude subscription, and only labelled.
+            if provider == 'claude' and '/.openclaw/' in str(item.get('cwd') or ''): client = 'OpenClaw'
             yield record(key, provider, session, item.get('timestamp'), model, item.get('cwd'),
                          client, input=u.get('input_tokens'), output=u.get('output_tokens'),
                          cacheRead=u.get('cache_read_input_tokens'), cacheWrite=u.get('cache_creation_input_tokens'),
@@ -820,7 +823,7 @@ def openclaw_event(row):
 def openclaw_records(path):
     """Assistant turns with usage from one OpenClaw agent database.
 
-    Both runtimes land here. The built-in runtime calls the model itself; the
+    Both OpenAI runtimes land here; claude-cli turns are left to the claude scanner. The built-in runtime calls the model itself; the
     Codex runtime runs `codex app-server` with its own CODEX_HOME under the
     agent folder (not ~/.codex, which the codex scanner reads) and mirrors each
     turn into this transcript, so this is the one place to count OpenClaw.
@@ -848,6 +851,9 @@ def openclaw_records(path):
             harness = message.get('agentHarnessId') or event.get('agentHarnessId') or harness or 'openclaw'
             uncached, cached = number(usage.get('input')), number(usage.get('cacheRead'))
             output, written = number(usage.get('output')), number(usage.get('cacheWrite'))
+            # The claude-cli runtime runs Claude Code, which writes its own transcript
+            # under ~/.claude/projects; the claude scanner counts those turns.
+            if message.get('provider') == 'claude-cli': continue
             # Delivery mirrors (a reply copied to a channel) carry an all-zero usage block.
             if not (uncached or output or cached or written): continue
             if cached and number(usage.get('totalTokens')) == uncached + output and uncached >= cached:
@@ -995,7 +1001,7 @@ class Ledger:
         update += ',timePrecision=COALESCE(excluded.timePrecision,events.timePrecision)'
         # A corrected T3 label can arrive from a local re-read or a newer synced
         # snapshot. An older copy labelled CLI must not undo that correction.
-        update += ",client=CASE WHEN excluded.client='T3 Code' THEN excluded.client ELSE events.client END"
+        update += ",client=CASE WHEN excluded.client IN ('T3 Code','OpenClaw') THEN excluded.client ELSE events.client END"
         self.db.execute(f'INSERT INTO events ({",".join(keys)}) VALUES ({",".join("?" for _ in keys)}) '
                         f'ON CONFLICT(id) DO UPDATE SET {update}', list(r.values()))
         if source is not None:

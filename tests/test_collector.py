@@ -1422,6 +1422,8 @@ class CollectorTests(unittest.TestCase):
             ('w1', {'type': 'message', 'id': 'u1', 'message': {'role': 'user', 'content': 'hoi'}}, False),
             ('w1', self.openclaw_turn('a1', native), False),
             ('w1', self.openclaw_turn('a2', mirrored, harness='codex'), True),
+            ('w1', {'type': 'message', 'id': 'c1', 'message': {'role': 'assistant', 'provider': 'claude-cli',
+                    'model': 'claude-sonnet-5-5', 'usage': {'input': 2, 'output': 4, 'cacheWrite': 75926}}}, False),
             ('w1', self.openclaw_turn('m1', {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0, 'totalTokens': 0},
                                       model='delivery-mirror'), False),
             # A fork copies the entry into another window with the same id.
@@ -1439,6 +1441,15 @@ class CollectorTests(unittest.TestCase):
         ledger = c.Ledger(self.root / 'openclaw.sqlite')
         for row in rows: ledger.put(row, path)
         self.assertEqual(ledger.db.execute('SELECT COUNT(*), SUM(input) FROM events').fetchone(), (2, 1674))
+
+    def test_claude_turns_from_openclaw_workspace_are_labelled_openclaw(self):
+        path = self.root / 'claude.jsonl'
+        path.write_text(json.dumps({'type': 'assistant', 'sessionId': 's', 'timestamp': '2026-10-02T15:25:00Z',
+                                    'cwd': str(self.root / '.openclaw/workspace'),
+                                    'message': {'id': 'msg1', 'model': 'claude-opus-5-5',
+                                                'usage': {'input_tokens': 2, 'output_tokens': 4}}}) + '\n')
+        rows = list(c.claude_records(path))
+        self.assertEqual((rows[0]['provider'], rows[0]['client']), ('claude', 'OpenClaw'))
 
     def test_openclaw_scan_reads_every_agent_and_ignores_codex_home_rollouts(self):
         self.openclaw_ledger([('w1', self.openclaw_turn('a1', {'input': 10, 'output': 2, 'totalTokens': 12}), False)])
